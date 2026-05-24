@@ -523,21 +523,73 @@ def is_valid_fallback_table(df: pd.DataFrame) -> bool:
 # into a single string with spaces.
 _META_STOP = r"(?=\s*(?:\||RAILWAY|DIVISION|SECTION|START\s*KM|LINE|ROUTE|RT[-\s]?CODE|FILE\s*NAME|RUN\s*NO|DATE|TRC\s*NO|$))"
 
-_META_PATTERNS = {
-    # ── TRC NO — all real-world separator variants ─────────────────────────
-    # TRC NO : 9001 | TRC NO-9001 | TRC NO. 9001 | TRC NO - 9001
-    # TRC NUMBER 9001 | TRC NO:- 9001
-    # U+00A0 (non-breaking space) in DOCX cells is normalised to ' ' before
-    # reaching here, but \s covers both just in case.
-    # U+2011 = non-breaking hyphen, U+2013/U+2014 = en/em dash
-    "trc_no":    re.compile(
-        # Handles all forms found in Indian Railways DOCX:
-        #   TRC NO : 9001 | TRC NO-9001 | TRC NO. 9001 | TRC NO - 9001
-        #   TRC NUMBER 9001 | TRC No: TRC-9001  (value may be prefixed 'TRC-')
-        # Captures the numeric portion only.
-        r"TRC\s*(?:NO\.?|NUMBER)\s*[:\-\=\u2011\u2013\u2014]*\s*(?:TRC[\-\s])?(\d+)",
-        re.IGNORECASE
+# ── Multi-pattern lists for fields with inconsistent DOCX formats ─────────
+# trc_no and run_date appear in many format variants across Indian Railways
+# DOCX reports.  Each field is stored as a list of compiled patterns tried
+# in priority order by _scan_text_for_metadata() — first match wins.
+#
+# TRC NO variants seen in the wild:
+#   TRC No: TRC-9001  |  TRC NO - 9001  |  TRC No:9001  |  TRC NO: TRC9001
+#   TRC NO:- 9001     |  TRC NUMBER 9001
+#
+# Date label variants seen in the wild:
+#   Date of Rec: 18.04.2026  |  RUN Date: 20/04/2026
+#   date: 13.04.2026         |  Run Date : 2026-04-20
+_TRC_PATTERNS: list = [
+    # P1 — Labelled (NO/NUMBER) + optional 'TRC-' prefix in value, digits only
+    #   Matches: TRC NO: 9001 | TRC NO - 9001 | TRC No: TRC-9001 | TRC NO:TRC9001
+    re.compile(
+        r"TRC\s*(?:NO\.?|NUMBER)\s*[:\-\.\=\s\u2011\u2013\u2014]*\s*"
+        r"(?:TRC[\-_\s]?)?(\d{3,})",
+        re.IGNORECASE,
     ),
+    # P2 — Labelled (NO/NUMBER) + alphanumeric value, extracts trailing digits
+    #   Matches: TRC NO: TRC9001 | TRC NO: RT10201321 (extracts last 4+ digits)
+    re.compile(
+        r"TRC\s*(?:NO\.?|NUMBER)\s*[:\-\.\=\s\u2011\u2013\u2014]*\s*"
+        r"[A-Z]*[\-_]?(\d{3,})",
+        re.IGNORECASE,
+    ),
+    # P3 — Bare 'TRC-9001' or 'TRC 9001' without a NO label
+    #   Matches: (TRC-9001) | TRC 9001 — used only when P1/P2 find nothing
+    re.compile(
+        r"TRC[\-_\s](\d{4,})",
+        re.IGNORECASE,
+    ),
+]
+
+_DATE_PATTERNS: list = [
+    # P1 — 'Date of Rec' (most specific label, highest priority)
+    #   Matches: Date of Rec: 18.04.2026 | Date of Rec - 18/04/2026
+    re.compile(
+        r"Date\s*of\s*Rec\s*[:\-]?\s*(\d{1,4}[/\-\.]\d{1,2}[/\-\.]\d{1,4})",
+        re.IGNORECASE,
+    ),
+    # P2 — 'RUN Date' / 'Run Date' (two-word label)
+    #   Matches: RUN Date: 20/04/2026 | Run Date : 2026-04-20
+    re.compile(
+        r"RUN\s+Date\s*[:\-]?\s*(\d{1,4}[/\-\.]\d{1,2}[/\-\.]\d{1,4})",
+        re.IGNORECASE,
+    ),
+    # P3 — Bare 'Date:' or 'DATE:' (single-word label, word-boundary guarded)
+    #   Matches: date: 13.04.2026 | DATE: 20.04.2026
+    #   (?<!\w) prevents matching 'RunDate:' mid-word
+    re.compile(
+        r"(?<!\w)Date\s*[:\-]\s*(\d{1,4}[/\-\.]\d{1,2}[/\-\.]\d{1,4})",
+        re.IGNORECASE,
+    ),
+    # P4 — 'Date' with optional separator (fallback — no mandatory colon)
+    #   Matches: Date 13.04.2026 (space separator only)
+    re.compile(
+        r"(?<!\w)Date\s+(\d{1,4}[/\-\.]\d{1,2}[/\-\.]\d{1,4})",
+        re.IGNORECASE,
+    ),
+]
+
+_META_PATTERNS = {
+    # trc_no and run_date now point to their pattern lists (handled specially
+    # by _scan_text_for_metadata — first match in the list wins).
+    "trc_no":    _TRC_PATTERNS,
     # RUN NO — single letter or alphanumeric (e.g. D, A, B1)
     "run_no":    re.compile(
         r"Run\s*(?:No\.?|Number)\s*[:\-\.\s]?\s*([A-Z0-9][A-Z0-9\-/()]*)",
@@ -552,15 +604,8 @@ _META_PATTERNS = {
         r"Direction\s*[:\-]?\s*(UP|DN|DOWN|UP\s*LINE|DN\s*LINE|DOWN\s*LINE)",
         re.IGNORECASE
     ),
-    # DATE — all separator styles: 20.04.2026 | 20/04/2026 | 2026-04-20
-    # Intentionally broad so it fires even when 'DATE:' is alone in a cell
-    # adjacent to a pure-number date in the next cell (handled by cell-pair
-    # scan in extract_metadata).
-    "run_date":  re.compile(
-        # Handles: DATE: 20.04.2026 | Run Date: 20.04.2026 | Date of Rec: 20.04.2026
-        r"(?:Run\s+)?Date(?:\s+of\s+Rec)?\s*[:\-]?\s*(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}|\d{2,4}[/\-\.]\d{1,2}[/\-\.]\d{1,2})",
-        re.IGNORECASE
-    ),
+    # run_date now points to its pattern list.
+    "run_date":  _DATE_PATTERNS,
     # ── Extended geography / report-header fields ──────────────────────────
     # All stop at the next metadata keyword to prevent cross-field bleed.
     # railway / division also accept 'Railways:' / 'Division:' label variants
@@ -596,17 +641,11 @@ _META_PATTERNS = {
     ),
 }
 
-# Fallback broader patterns for run_date — dot separator included, 1-2 digit month
+# Final-resort date fallback — pure numeric date anywhere in text, no label
+# required.  Only fires if all _DATE_PATTERNS fail.  Both DD.MM.YYYY and
+# YYYY.MM.DD forms are accepted; 4-digit year is mandatory to avoid false hits.
 _DATE_FALLBACK = re.compile(
-    r"\b(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4})\b"
-)
-
-# Fallback pattern for TRC number in paragraph text where it appears as:
-#   '(TRC-9001)'  |  'TRC-9001'  |  'TRC 9001'  (no 'NO' label)
-# Used only when the primary trc_no pattern finds nothing.
-_TRC_FALLBACK = re.compile(
-    r"(?:TRC[\-\s])(\d{4,})",
-    re.IGNORECASE
+    r"\b(\d{1,4}[/\-\.]\d{1,2}[/\-\.]\d{1,4})\b"
 )
 
 
@@ -656,22 +695,33 @@ def _scan_text_for_metadata(text: str) -> dict:
     Scan a single block of text for all metadata fields.
     Returns a dict with found values (or "" for missing fields).
 
+    Fields whose value in _META_PATTERNS is a LIST of patterns (trc_no,
+    run_date) are tried in priority order — first match wins.  All other
+    fields use a single compiled pattern as before.
+
     run_date is always normalised to YYYY-MM-DD before returning.
     """
     result: dict[str, str] = {}
-    for key, pattern in _META_PATTERNS.items():
-        m = pattern.search(text)
-        result[key] = m.group(1).strip() if m else ""
+    for key, pattern_or_list in _META_PATTERNS.items():
+        if isinstance(pattern_or_list, list):
+            # Multi-pattern field: try each pattern in order, use first match
+            matched = ""
+            for pat in pattern_or_list:
+                m = pat.search(text)
+                if m:
+                    matched = m.group(1).strip()
+                    break
+            result[key] = matched
+        else:
+            m = pattern_or_list.search(text)
+            result[key] = m.group(1).strip() if m else ""
 
-    # Fallback date extraction (dot-separator aware, no keyword prefix required)
+    # Final-resort date fallback — pure date anywhere, no label required.
+    # Accepts both DD.MM.YYYY and YYYY.MM.DD; 4-digit year prevents false hits.
     if not result.get("run_date"):
         m = _DATE_FALLBACK.search(text)
-        result["run_date"] = m.group(1) if m else ""
-
-    # Fallback TRC number extraction — catches '(TRC-9001)' in paragraph titles
-    if not result.get("trc_no"):
-        m = _TRC_FALLBACK.search(text)
-        result["trc_no"] = m.group(1) if m else ""
+        if m:
+            result["run_date"] = m.group(1)
 
     # Always normalise run_date to ISO YYYY-MM-DD
     if result.get("run_date"):
@@ -802,43 +852,69 @@ def extract_metadata(doc, table_index: int) -> dict:
         "line":      "",
     }
 
-    # ── Strategy 1: scan all paragraphs ──────────────────────────────────────
-    # doc.paragraphs includes top-level paragraphs only; paragraphs inside
-    # table cells are NOT included here (they are handled in Strategy 2).
-    para_texts: list[str] = []
+    # ── Strategy 1: build ONE combined full-document text blob ───────────────
+    #
+    # Combine ALL paragraphs AND ALL table cell text into a single searchable
+    # string.  This ensures metadata buried anywhere in the document — whether
+    # in a top-level paragraph, a header table cell, or a merged cell — is
+    # captured by a single regex pass.
+    #
+    # doc.paragraphs = top-level only (NOT inside table cells).
+    # doc.tables[*].rows[*].cells[*].text = cell paragraphs joined by \n.
+    # Both sources are needed because DOCX stores them separately.
+    all_text_parts: list[str] = []
     try:
         for para in doc.paragraphs:
-            text = para.text.replace("\xa0", " ").replace("\x00", "").strip()
-            if text:
-                para_texts.append(text)
+            t = para.text.replace("\xa0", " ").replace("\x00", "").strip()
+            if t:
+                all_text_parts.append(t)
     except Exception as exc:
         log.debug(f"  [META] Paragraph scan error: {exc}")
 
-    if para_texts:
-        full_para_text = " | ".join(para_texts)
-        para_meta = _scan_text_for_metadata(full_para_text)
-        for k, v in para_meta.items():
+    try:
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    t = cell.text.replace("\xa0", " ").replace("\x00", "").strip()
+                    if t:
+                        all_text_parts.append(t)
+    except Exception as exc:
+        log.debug(f"  [META] Table cell text scan error: {exc}")
+
+    if all_text_parts:
+        full_doc_text = " | ".join(all_text_parts)
+        blob_meta = _scan_text_for_metadata(full_doc_text)
+        for k, v in blob_meta.items():
             if v:
                 meta[k] = v
+        log.debug(
+            "  [META-BLOB] trc_no=%r run_date=%r (from full-doc text blob)",
+            meta.get("trc_no"), meta.get("run_date"),
+        )
 
-    # ── Strategy 2: scan ALL tables (first MAX_META_SCAN rows each) ───────────
-    # Most Indian Railways DOCX files embed metadata in small header tables
-    # (Table 0 and Table 1) that sit BEFORE the main data table.
-    # We scan every table so no matter where the header table falls we catch it.
+    # ── Strategy 2: per-row cell-pair scan (catches split label|value cells) ──
+    #
+    # The regex blob above joins cells with ' | ' which usually lets regex
+    # match.  But some reports have the label in one cell and the bare value
+    # in the adjacent cell with NO textual separator at all:
+    #   Cell0="TRC NO"  Cell1="9001"
+    # When the cells are joined as "TRC NO | 9001" the regex still works, but
+    # we keep the cell-pair scan as an additional safety net for edge cases
+    # and to fill any remaining gaps.
     try:
         for tbl in doc.tables:
             scan_rows = list(tbl.rows)[:MAX_META_SCAN]
             for row in scan_rows:
                 cells = [_cell_text(c) for c in row.cells]
 
-                # 2a: regex on the full joined row text
+                # 2a: regex on the full joined row text (gap-fill only)
                 row_text = " ".join(cells)
                 row_meta = _scan_text_for_metadata(row_text)
                 for k, v in row_meta.items():
                     if v and not meta.get(k):
                         meta[k] = v
 
-                # 2b: cell-pair scan — catches "TRC NO" | "9001" split across cells
+                # 2b: cell-pair scan — catches ["TRC NO", "9001"] split cells
                 _extract_cell_pairs(cells, meta)
 
                 # Early exit once all critical fields are filled

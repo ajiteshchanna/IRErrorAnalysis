@@ -54,11 +54,32 @@ _META_FIELDS = [
 ]
 
 # ── Compiled regex for each metadata field ────────────────────────────────────
-# Handles both colon and hyphen separators, flexible whitespace.
+# Handles all real-world separator variants observed in Indian Railways DOCX:
+#   colon, hyphen, equals, dot, space, Unicode dashes (en/em/non-breaking).
+#
+# trc_no  variants: TRC NO: 9001 | TRC NO - 9001 | TRC No:9001 | TRC NO: TRC9001
+#                   TRC NUMBER 9001 | TRC NO:- 9001
+# run_date variants: Date of Rec: 18.04.2026 | RUN Date: 20/04/2026
+#                    date: 13.04.2026         | Run Date : 2026-04-20
 _META_RE = {
-    "trc_no":      re.compile(r"TRC\s*NO\s*[:\-]\s*([A-Z0-9]+)", re.IGNORECASE),
+    # trc_no: separator is now OPTIONAL (\s* instead of [:\-]).
+    # Accepts TRC-prefix in value ('TRC-9001') and extracts the numeric part.
+    # Also accepts NUMBER synonym and Unicode dashes.
+    "trc_no":      re.compile(
+        r"TRC\s*(?:NO\.?|NUMBER)\s*[:\-\.\=\s\u2011\u2013\u2014]*\s*"
+        r"(?:TRC[\-_\s]?)?(\d{3,})",
+        re.IGNORECASE,
+    ),
+    # run_date: three labelled variants in priority order, captured by alternation.
+    # \d{1,4} at both ends accepts DD.MM.YYYY AND YYYY-MM-DD.
     "run_date":    re.compile(
-        r"DATE\s*[:\-]?\s*(\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4})", re.IGNORECASE),
+        r"(?:"
+        r"Date\s*of\s*Rec\s*[:\-]?"      # 'Date of Rec:' (highest priority)
+        r"|RUN\s+Date\s*[:\-]?"           # 'RUN Date:'
+        r"|(?<!\w)Date\s*[:\-]"           # bare 'Date:' / 'DATE:' (colon mandatory)
+        r")\s*(\d{1,4}[./\-]\d{1,2}[./\-]\d{1,4})",
+        re.IGNORECASE,
+    ),
     "run_no":      re.compile(r"RUN\s*NO\.?\s*[:\-]?\s*([A-Z0-9]+)", re.IGNORECASE),
     "route":       re.compile(r"ROUTE\s*[:\-]?\s*([^\s|,\n]+)", re.IGNORECASE),
     "rt_code":     re.compile(r"RT[\-\s]?CODE\s*[:\-]?\s*([^\s|,\n]+)", re.IGNORECASE),
@@ -142,20 +163,37 @@ def _merge_meta(base: dict, update: dict) -> dict:
 def _normalise_date(raw: str | None) -> str | None:
     """
     Convert common date formats to YYYY-MM-DD.
-    Handles: DD.MM.YYYY, DD/MM/YYYY, DD-MM-YYYY.
+
+    Accepts:
+        DD.MM.YYYY  DD/MM/YYYY  DD-MM-YYYY   → day-first
+        YYYY-MM-DD  YYYY.MM.DD  YYYY/MM/DD   → year-first (ISO-like)
+        DD.MM.YY    DD/MM/YY    DD-MM-YY     → 2-digit year (2000s assumed)
+
     Returns None if unparseable.
     """
     if not raw:
         return None
-    m = re.match(r"(\d{1,2})[./\-](\d{1,2})[./\-](\d{2,4})", raw.strip())
+    m = re.match(r"(\d{1,4})[./\-](\d{1,2})[./\-](\d{1,4})", raw.strip())
     if not m:
-        return raw  # already in some other format, return as-is
-    d, mo, y = m.group(1), m.group(2), m.group(3)
-    if len(y) == 2:
-        y = "20" + y
+        return raw  # unrecognised format — return as-is
+    a, b, c = m.group(1), m.group(2), m.group(3)
     try:
-        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
-    except ValueError:
+        if len(a) == 4:
+            # YYYY-MM-DD (or YYYY.MM.DD / YYYY/MM/DD)
+            year, month, day = int(a), int(b), int(c)
+        elif len(c) == 4:
+            # DD-MM-YYYY
+            day, month, year = int(a), int(b), int(c)
+        elif len(c) == 2:
+            # DD-MM-YY  →  assume 2000s
+            day, month, year = int(a), int(b), 2000 + int(c)
+        else:
+            return raw  # unrecognised layout — keep as-is
+        # Sanity check
+        if not (1 <= month <= 12 and 1 <= day <= 31 and 1900 <= year <= 2100):
+            return raw
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    except (ValueError, TypeError):
         return raw
 
 
@@ -528,6 +566,41 @@ def convert_urgent_report_docx_to_xlsx(docx_path: Path, output_dir: Path) -> Pat
         file_meta["trc_no"] = trc_no_para
     if section_spd_para:
         file_meta["section_spd"] = section_spd_para
+
+    # ── Full-document text blob scan (Change 9) ────────────────────────────
+    # Build ONE combined text from ALL paragraphs + ALL table cells and scan
+    # with the improved _META_RE patterns.  This catches trc_no / run_date
+    # that appear in any position in the document, even when the per-block
+    # table scan would miss them (e.g. metadata only in a cover paragraph).
+    try:
+        _blob_parts: list[str] = []
+        for _para in doc.paragraphs:
+            _t = _para.text.replace("\xa0", " ").replace("\x00", "").strip()
+            if _t:
+                _blob_parts.append(_t)
+        body_xml   = doc.element.body
+        tbls_all   = body_xml.findall(f".//{{{_W}}}tbl")
+        for _tbl in tbls_all:
+            for _tr in _tbl.findall(f"{{{_W}}}tr"):
+                for _tc in _tr.findall(f"{{{_W}}}tc"):
+                    _ct = _cell_text(_tc)
+                    if _ct:
+                        _blob_parts.append(_ct)
+        _full_text = " | ".join(_blob_parts)
+        _blob_meta = _scan_text_for_meta(_full_text)
+        # Normalise date from blob
+        if _blob_meta.get("run_date"):
+            _blob_meta["run_date"] = _normalise_date(_blob_meta["run_date"])
+        # Fill gaps in file_meta from blob
+        for _fld, _val in _blob_meta.items():
+            if _val and not file_meta.get(_fld):
+                file_meta[_fld] = _val
+        log.debug(
+            "    [BLOB] trc_no=%r run_date=%r (from full-doc blob)",
+            file_meta.get("trc_no"), file_meta.get("run_date"),
+        )
+    except Exception as _exc:
+        log.debug(f"    [BLOB] Full-doc scan error: {_exc}")
 
     # Read all tables via lxml (avoids InvalidXmlError on missing <w:tblGrid>)
     body      = doc.element.body
