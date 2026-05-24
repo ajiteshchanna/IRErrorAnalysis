@@ -2,7 +2,7 @@
 
 A comprehensive, automated data pipeline and analytics web application designed for processing, storing, and analyzing Indian Railways TRC (Track Recording Car) data. This project seamlessly ingests multiple file formats (DOCX, XLSX), normalizes the data into a scalable one-table-per-file SQLite architecture, and provides a powerful web-based UI for insightful analytics.
 
-## 🚀 Features
+## Features
 
 - **Automated Data Ingestion:** Recursively scans and processes nested directories of `.xlsx` and `.docx` files.
 - **DOCX to XLSX Conversion:** Built-in conversion layer that structured extracts inspection data from Word documents.
